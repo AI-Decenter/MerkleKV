@@ -17,6 +17,7 @@ thiserror = "1.0.56"
 config = "0.13.4"
 rumqttc = "0.24.0"
 sha2 = "0.10.8"
+sled = "0.34.7"
 
 [dev-dependencies]
 tempfile = "3.9.0"
