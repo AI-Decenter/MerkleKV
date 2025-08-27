@@ -21,3 +21,8 @@ sha2 = "0.10.8"
 [dev-dependencies]
 tempfile = "3.9.0"
 mockall = "0.12.1"
+rand = "0.8"
+
+[[example]]
+name = "test_client"
+path = "examples/test_client.rs"

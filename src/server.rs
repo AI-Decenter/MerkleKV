@@ -1,28 +1,31 @@
-//! # TCP Server Implementation
+//! # 🚀 Asynchronous TCP Server Implementation
 //!
-//! This module provides the TCP server that handles client connections and processes
-//! commands. It implements a simple request-response protocol over TCP sockets.
+//! This module provides a high-performance TCP server that handles client connections 
+//! and processes commands using Tokio's async runtime. It demonstrates modern Rust
+//! async patterns and concurrent programming techniques.
 //!
-//! ## Architecture
+//! ## 🏗️ Architecture Overview
 //! 
-//! The server uses an asynchronous, multi-connection design:
-//! - Main server loop accepts incoming connections
-//! - Each connection spawns a separate async task
-//! - Commands are parsed and executed against the shared storage
-//! - Responses are sent back to the client
+//! The server uses an asynchronous, multi-connection design pattern:
+//! - 🎯 **Main Event Loop**: Accepts incoming connections continuously
+//! - ⚡ **Task Spawning**: Each connection spawns a separate async task
+//! - 🔧 **Command Processing**: Commands are parsed and executed against shared storage
+//! - 📡 **Response Protocol**: Structured responses sent back to clients
 //!
-//! ## Protocol
+//! ## 📋 Protocol Specification
 //! 
-//! The server implements a Redis-like text protocol:
-//! - Commands: `GET key`, `SET key value`, `DELETE key`
-//! - Responses: `VALUE data`, `OK`, `NOT_FOUND`, `ERROR message`
-//! - All messages are terminated with `\r\n`
+//! The server implements a Redis-inspired text protocol with clear delimiters:
+//! - 📝 **Commands**: `GET key`, `SET key value`, `DELETE key`
+//! - ✅ **Success**: `VALUE data`, `OK`
+//! - ❌ **Errors**: `NOT_FOUND`, `ERROR message`
+//! - 🔚 **Termination**: All messages end with `\r\n` (CRLF)
 //!
-//! ## Concurrency
+//! ## 🔒 Concurrency & Thread Safety
 //! 
-//! The storage engine is wrapped in `Arc<Mutex<>>` to allow safe concurrent access
-//! from multiple client connections. Each connection gets its own task but shares
-//! the same underlying storage.
+//! The storage engine uses `Arc<Mutex<T>>` for safe concurrent access:
+//! - 🧵 **Arc**: Atomic Reference Counting for shared ownership
+//! - 🔐 **Mutex**: Mutual exclusion for synchronized access
+//! - 🎭 **Async Tasks**: Each connection runs independently
 
 use crate::store::kv_engine::KvEngine;
 use anyhow::Result;
@@ -36,15 +39,19 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::protocol::{Command, Protocol};
 
-/// TCP server for handling client connections.
+/// 🏗️ TCP Server for handling client connections with async I/O.
 /// 
-/// The server binds to a specified address and port, then accepts incoming
-/// connections and processes commands asynchronously.
+/// This server demonstrates several key Rust async patterns:
+/// - 📡 **TcpListener**: Binds to an address and accepts connections
+/// - 🎯 **Task Spawning**: Uses `tokio::spawn` for concurrent handling
+/// - 🔄 **Event Loop**: Continuously processes incoming connections
+/// - 🛡️ **Error Recovery**: Continues serving despite individual connection failures
 pub struct Server {
-    /// Server configuration including bind address and port
+    /// 📋 Server configuration including bind address and port
     config: Config,
     
-    /// The storage engine that will be shared across all client connections
+    /// 🗄️ The storage engine shared across all client connections
+    /// Uses Arc<Mutex<T>> pattern for thread-safe sharing
     store: KvEngine,
 }
 
@@ -61,134 +68,234 @@ impl Server {
         Self { config, store }
     }
 
-    /// Start the server and begin accepting connections.
+    /// 🚀 Start the server and begin accepting connections.
     /// 
-    /// This method runs indefinitely, accepting new connections and spawning
-    /// tasks to handle them. Each connection gets its own async task but all
-    /// share the same storage engine.
+    /// This method implements the main server event loop using Tokio's async runtime:
+    /// 1. 🔌 **Bind**: Creates a TcpListener on the configured address
+    /// 2. 🔄 **Loop**: Continuously accepts new connections
+    /// 3. 🧵 **Spawn**: Creates independent tasks for each client
+    /// 4. 🛡️ **Recovery**: Handles individual connection failures gracefully
     /// 
-    /// # Returns
-    /// * `Result<()>` - Never returns normally, only on bind errors
+    /// # 🎯 Async Patterns Demonstrated
+    /// - **Non-blocking I/O**: Uses `.await` for async operations
+    /// - **Task Concurrency**: Multiple connections handled simultaneously
+    /// - **Resource Sharing**: Storage engine shared via Arc<Mutex<T>>
     /// 
-    /// # Errors
+    /// # 📊 Returns
+    /// * `Result<()>` - Never returns normally, only on fatal bind errors
+    /// 
+    /// # ⚠️ Error Conditions
     /// Returns an error if:
-    /// - Unable to bind to the specified address/port
-    /// - Network-level errors occur
+    /// - 🚫 Unable to bind to the specified address/port (port in use, permissions)
+    /// - 🌐 Network-level configuration errors occur
+    /// - 🔒 System resource limitations prevent binding
     /// 
-    /// # Example
+    /// # 💡 Usage Example
     /// ```rust
     /// let config = Config::default();
     /// let store = KvEngine::new("./data")?;
     /// let server = Server::new(config, store);
-    /// server.run().await?; // Runs forever
+    /// 
+    /// // 🚀 This runs forever, handling multiple concurrent connections
+    /// server.run().await?;
     /// ```
     pub async fn run(&self) -> Result<()> {
+        // 🔗 Construct the bind address from config
         let addr = format!("{}:{}", self.config.host, self.config.port);
+        
+        // 🎯 Bind to the address - this can fail if port is in use
         let listener = TcpListener::bind(&addr).await?;
-        info!("Server listening on {}", addr);
+        info!("🚀 Server listening on {} (ready for connections)", addr);
 
-        // Wrap the storage in `Arc<Mutex<>>` for safe concurrent access
+        // 🔄 Wrap storage in Arc<Mutex<T>> for thread-safe concurrent access
+        // Arc = Atomic Reference Counting (shared ownership)
+        // Mutex = Mutual exclusion lock (synchronized access)
         let store = Arc::new(Mutex::new(self.store.clone()));
 
-        // TODO: Add graceful shutdown handling
-        // TODO: Add connection limits and rate limiting
-        // TODO: Add metrics collection (connections, commands/sec, etc.)
+        // 🔮 Future enhancements to consider:
+        // TODO: 🛑 Add graceful shutdown handling (SIGINT/SIGTERM)
+        // TODO: 🚦 Add connection limits and rate limiting per client
+        // TODO: 📊 Add metrics collection (connections/sec, commands/sec, errors)
+        // TODO: 🔍 Add request/response logging for debugging
+        // TODO: 🕐 Add connection timeouts to prevent resource leaks
 
+        // 🔄 Main event loop - runs indefinitely
         loop {
+            // 🤝 Accept incoming connection (blocking until client connects)
             match listener.accept().await {
-                Ok((socket, addr)) => {
-                    info!("Accepted connection from {}", addr);
+                Ok((socket, client_addr)) => {
+                    info!("✅ New client connected from: {}", client_addr);
+                    
+                    // 📋 Clone the store reference for this connection
                     let store_clone = Arc::clone(&store);
                     
-                    // Spawn a new task for each client connection
+                    // 🧵 Spawn independent async task for this client
+                    // Each task runs concurrently without blocking others
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(socket, addr, store_clone).await {
-                            error!("Error handling connection from {}: {}", addr, e);
+                        // 🎭 Handle this client's session
+                        match handle_connection(socket, client_addr, store_clone).await {
+                            Ok(_) => info!("👋 Client {} disconnected cleanly", client_addr),
+                            Err(e) => error!("💥 Error handling client {}: {}", client_addr, e),
                         }
                     });
                 }
                 Err(e) => {
-                    error!("Failed to accept connection: {}", e);
-                    // Continue accepting other connections despite this error
+                    // 🚨 Log accept errors but continue serving other clients
+                    error!("⚠️  Failed to accept connection: {}", e);
+                    // 🔄 Continue the loop - one bad connection shouldn't kill server
                 }
             }
         }
     }
 }
 
-/// Handle a single client connection.
+/// 🎭 Handle a single client connection with full async I/O.
 /// 
-/// This function processes commands from a client connection until the client
-/// disconnects or an error occurs. Each command is parsed, executed against
-/// the storage, and a response is sent back.
+/// This function demonstrates several advanced async patterns:
+/// - 📖 **Buffered Reading**: Reads data in chunks for efficiency
+/// - 🔄 **Event Loop**: Processes multiple commands per connection
+/// - 🔐 **Mutex Management**: Acquires locks only when needed
+/// - 🛡️ **Error Handling**: Graceful degradation and client feedback
 /// 
-/// # Arguments
-/// * `socket` - The TCP stream for this client connection
-/// * `addr` - Client's address (for logging)
-/// * `store` - Shared reference to the storage engine
+/// # 🎯 Parameters
+/// * `socket` - 📡 The TCP stream for bidirectional communication
+/// * `client_addr` - 🏠 Client's network address (for logging & debugging)
+/// * `store` - 🗄️ Thread-safe reference to the shared storage engine
 /// 
-/// # Returns
-/// * `Result<()>` - Success when client disconnects normally, error on failures
+/// # 📊 Returns
+/// * `Result<()>` - Success when client disconnects gracefully
 /// 
-/// # Protocol Handling
-/// - Reads commands from the socket in 1KB chunks
-/// - Parses commands using the Protocol parser
-/// - Executes commands against the storage engine
-/// - Sends appropriate responses back to the client
+/// # 🔄 Protocol Flow
+/// 1. 📥 **Read**: Get raw bytes from socket buffer
+/// 2. 🔤 **Parse**: Convert bytes to UTF-8 string
+/// 3. 🧠 **Process**: Parse command and execute against storage
+/// 4. 📤 **Respond**: Send formatted response back to client
+/// 5. 🔄 **Repeat**: Continue until client disconnects
 /// 
-/// # Error Handling
-/// - Invalid commands result in ERROR responses
-/// - Network errors terminate the connection
-/// - Storage errors are converted to ERROR responses
+/// # ⚠️ Error Scenarios
+/// - 🔌 **Network errors**: Client disconnection, timeouts
+/// - 📝 **Protocol errors**: Invalid UTF-8, malformed commands  
+/// - 🗄️ **Storage errors**: Lock contention, internal failures
 async fn handle_connection(
     mut socket: TcpStream,
-    addr: SocketAddr,
+    client_addr: SocketAddr,
     store: Arc<Mutex<KvEngine>>,
 ) -> Result<()> {
-    let mut buffer = [0; 1024];
+    // 📦 Create buffer for reading client data (1KB chunks)
+    let mut buffer = [0u8; 1024];
+    
+    info!("🔗 Starting session for client: {}", client_addr);
 
-    while let Ok(n) = socket.read(&mut buffer).await {
-        if n == 0 {
-            // Client closed the connection
-            info!("Connection closed by {}", addr);
-            return Ok(());
-        }
-
-        // Convert received bytes to string
-        let request = std::str::from_utf8(&buffer[..n])?;
-        let protocol = Protocol::new();
-        
-        match protocol.parse(request) {
-            Ok(command) => {
-                // Lock the storage for the duration of this command
-                let mut store = store.lock().await;
-                let response = match command {
-                    Command::Get { key } => {
-                        match store.get(&key) {
-                            Some(value) => format!("VALUE {}\r\n", value),
-                            None => "NOT_FOUND\r\n".to_string(),
-                        }
-                    }
-                    Command::Set { key, value } => {
-                        store.set(key, value);
-                        "OK\r\n".to_string()
-                    }
-                    Command::Delete { key } => {
-                        store.delete(&key);
-                        "OK\r\n".to_string()
+    // 🔄 Main client communication loop
+    loop {
+        // 📖 Read data from client socket (async, non-blocking)
+        match socket.read(&mut buffer).await {
+            Ok(0) => {
+                // 👋 Client closed connection gracefully (EOF)
+                info!("🔚 Client {} closed connection", client_addr);
+                return Ok(());
+            }
+            Ok(bytes_read) => {
+                // 📊 Log received data size for debugging
+                log::debug!("📥 Received {} bytes from {}", bytes_read, client_addr);
+                
+                // 🔤 Convert raw bytes to UTF-8 string
+                let request_str = match std::str::from_utf8(&buffer[..bytes_read]) {
+                    Ok(s) => s.trim(), // Remove whitespace/newlines
+                    Err(e) => {
+                        // 💥 Invalid UTF-8 - send error response
+                        let error_msg = format!("❌ ERROR Invalid UTF-8: {}\r\n", e);
+                        socket.write_all(error_msg.as_bytes()).await?;
+                        continue; // Try next command
                     }
                 };
+
+                log::debug!("🔍 Processing command: '{}'", request_str);
                 
-                // Send response back to client
+                // 🧠 Parse and execute the command
+                let response = process_command(request_str, &store, client_addr).await;
+                
+                // 📤 Send response back to client
                 socket.write_all(response.as_bytes()).await?;
+                log::debug!("📤 Sent response to {}: {}", client_addr, response.trim());
             }
             Err(e) => {
-                // Send error response for invalid commands
-                let error_msg = format!("ERROR {}\r\n", e);
-                socket.write_all(error_msg.as_bytes()).await?;
+                // 🚨 Network error occurred
+                error!("💥 Network error with client {}: {}", client_addr, e);
             }
         }
     }
+}
 
-    Ok(())
+/// 🧠 Process a single command and return a formatted response.
+/// 
+/// This function encapsulates the command processing logic, demonstrating:
+/// - 🔍 **Command Parsing**: Using the Protocol parser for validation
+/// - 🔐 **Lock Management**: Acquiring mutex locks efficiently  
+/// - 🎯 **Pattern Matching**: Rust's powerful match expressions
+/// - 📊 **Response Formatting**: Consistent protocol responses
+/// 
+/// # 🎯 Parameters
+/// * `request` - 📝 Raw command string from client
+/// * `store` - 🗄️ Thread-safe storage reference
+/// * `client_addr` - 🏠 Client address for enhanced logging
+/// 
+/// # 📊 Returns
+/// * `String` - Formatted response ready to send to client
+/// 
+/// # 🔄 Command Processing Flow
+/// 1. 🔍 **Parse**: Validate command syntax using Protocol parser
+/// 2. 🔐 **Lock**: Acquire exclusive access to storage (brief duration)
+/// 3. 🎯 **Execute**: Perform the requested operation
+/// 4. 📤 **Format**: Create standardized response string
+async fn process_command(
+    request: &str, 
+    store: &Arc<Mutex<KvEngine>>, 
+    client_addr: SocketAddr
+) -> String {
+    // 🔧 Create protocol parser instance
+    let protocol = Protocol::new();
+    
+    // 🔍 Parse the incoming command
+    match protocol.parse(request) {
+        Ok(command) => {
+            // 🔐 Acquire exclusive lock on storage (async-aware mutex)
+            let mut store_guard = store.lock().await;
+            
+            // 🎯 Execute command using Rust's pattern matching
+            match command {
+                Command::Get { key } => {
+                    log::debug!("🔍 GET operation for key: '{}' from {}", key, client_addr);
+                    match store_guard.get(&key) {
+                        Some(value) => {
+                            log::debug!("✅ Found value for '{}': '{}'", key, value);
+                            format!("✨ VALUE {}\r\n", value)
+                        },
+                        None => {
+                            log::debug!("❌ Key '{}' not found", key);
+                            "🔍 NOT_FOUND\r\n".to_string()
+                        }
+                    }
+                }
+                Command::Set { key, value } => {
+                    log::debug!("💾 SET operation: '{}' = '{}' from {}", key, value, client_addr);
+                    store_guard.set(key.clone(), value.clone());
+                    log::debug!("✅ Successfully stored '{}' = '{}'", key, value);
+                    "✅ OK\r\n".to_string()
+                }
+                Command::Delete { key } => {
+                    log::debug!("🗑️ DELETE operation for key: '{}' from {}", key, client_addr);
+                    store_guard.delete(&key);
+                    log::debug!("✅ Deleted key: '{}'", key);
+                    "🗑️ OK\r\n".to_string()
+                }
+            }
+            // 🔓 Lock automatically released when guard goes out of scope
+        }
+        Err(parse_error) => {
+            // 💥 Command parsing failed - return detailed error
+            log::warn!("⚠️ Invalid command from {}: '{}' -> {}", client_addr, request, parse_error);
+            format!("❌ ERROR Invalid command: {}\r\n", parse_error)
+        }
+    }
 }
