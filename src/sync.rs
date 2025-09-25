@@ -1,27 +1,12 @@
-//! sync.rs — Minimal, easy-to-read Merkle-based one-way sync (local ← remote)
-//
-//! What this does (high-level):
-//! 1) Build a Merkle snapshot from the *local* store (via scan("") + get()).
-//! 2) Build a Merkle snapshot from the *remote* peer (via SCAN + GET).
-//! 3) Compare the two trees with `diff_keys()` to find differing keys.
-//! 4) Apply changes so that local == remote (set/update or delete).
-//!
-//! Notes:
-//! - This is intentionally simple (no prefix fanout).
-//! - Wire format matches your server.rs today:
-//!     SCAN <prefix>   →  "KEYS <n>\r\n<k1>\r\n...<kn>\r\n"
-//!     GET <key>       →  "VALUE <plain>\r\n"   or "NOT_FOUND\r\n"
-//! - MerkleTree expects &str values, so we assume UTF-8 strings.
-//!
-//! How the SYNC command handler should call this:
-//!     let mut mgr = sync_manager.lock().await;
-//!     match mgr.sync_once(&host, port).await { Ok(_) => "OK", Err(e) => ... };
-
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -33,15 +18,20 @@ use crate::config::Config;
 use crate::store::merkle::MerkleTree;
 use crate::store::KVEngineStoreTrait;
 
+const FANOUT: &[u8] =
+    b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ:_-./";
+
+const DEFAULT_MAX_DEPTH: usize = 20;
+const DEFAULT_LEAF_THRESHOLD: usize = 200;
+
 pub struct SyncManager {
-    /// Shared storage used by all connections and the sync process
     store: Arc<Mutex<Box<dyn KVEngineStoreTrait + Send + Sync>>>,
-    /// Optional background interval
     sync_interval: Duration,
+    max_depth: usize,
+    leaf_threshold: usize,
 }
 
 impl SyncManager {
-    /// Construct a SyncManager that uses the *same* shared store as the server.
     pub fn new_with_shared_store(
         cfg: &Config,
         store: Arc<Mutex<Box<dyn KVEngineStoreTrait + Send + Sync>>>,
@@ -49,45 +39,20 @@ impl SyncManager {
         Self {
             store,
             sync_interval: Duration::from_secs(cfg.sync_interval_seconds),
+            max_depth: DEFAULT_MAX_DEPTH,
+            leaf_threshold: DEFAULT_LEAF_THRESHOLD,
         }
     }
 
-    /// One-shot sync: make local data equal to remote data.
-    pub async fn sync_once(&mut self, host: &str, port: u16) -> Result<()> {
+    /// One-shot: sync local with remote at host:port
+    pub async fn sync_once(&self, host: &str, port: u16) -> Result<()> {
         let addr = format!("{host}:{port}");
-        info!("SYNC (Merkle diff) → {}", addr);
-
-        // 1) Local snapshot
-        let (local_tree, _local_map) = self.build_local_merkle_snapshot().await;
-
-        // 2) Remote snapshot
-        let (remote_tree, remote_map) = self.build_remote_merkle_snapshot(&addr).await?;
-
-        // 3) Diff
-        let diffs = local_tree.diff_keys(&remote_tree);
-        if diffs.is_empty() {
-            info!("SYNC: already identical (no diff)");
-            return Ok(());
-        }
-
-        // 4) Apply changes: local := remote
-        let mut guard = self.store.lock().await;
-        for k in diffs {
-            if let Some(rv) = remote_map.get(&k) {
-                // set / overwrite
-                let _ = guard.set(k.clone(), rv.clone());
-            } else {
-                // missing remotely → delete local
-                let _ = guard.delete(&k);
-            }
-        }
-
-        info!("SYNC: done (local now matches remote)");
-        Ok(())
+        info!("SYNC (recursive Merkle) → {}", addr);
+        self.sync_prefix_recursive(&addr, String::new(), 0).await
     }
 
-    /// Optional background loop (best-effort).
-    pub async fn start_sync_loop(&mut self, host: String, port: u16) {
+    /// sync loop
+    pub async fn start_sync_loop(&self, host: String, port: u16) {
         let mut interval = time::interval(self.sync_interval);
         let addr = format!("{host}:{port}");
         loop {
@@ -98,65 +63,155 @@ impl SyncManager {
         }
     }
 
-    // ───────────── Snapshots ─────────────
+    // ─────────────────── Recursive by prefix ───────────────────
 
-    /// Build local Merkle snapshot from scan("") + get().
-    async fn build_local_merkle_snapshot(&self) -> (MerkleTree, HashMap<String, String>) {
+    /// Recursive by prefix: compare HASH(local,prefix) vs HASH(remote,prefix).
+    /// If different: split by FANOUT; if at leaf: reconcile by SCAN prefix + GET.
+    fn sync_prefix_recursive<'a>(
+        &'a self,
+        addr: &'a str,
+        prefix: String,
+        depth: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            // 1) Hash local/remote with prefix
+            let local_hex = self.local_merkle_hex(&prefix).await?;
+            let remote_hex = self.remote_hash_hex(addr, &prefix).await?;
+
+            debug!("PREFIX {:?} depth={} local={} remote={}",
+                   prefix, depth, &local_hex[..8], &remote_hex[..8]);
+
+            if local_hex == remote_hex {
+                // If equal → skip this branch.
+                return Ok(());
+            }
+
+            // 2) If at leaf (max depth) → reconcile directly
+            if depth >= self.max_depth {
+                self.reconcile_leaf(addr, &prefix).await?;
+                return Ok(());
+            }
+
+            // 3) If not at leaf → split recursively by next character in FANOUT
+            for &ch in FANOUT {
+                let mut sub = prefix.clone();
+                sub.push(ch as char);
+                self.sync_prefix_recursive(addr, sub, depth + 1).await?;
+            }
+
+            Ok(())
+        })
+    }
+
+    // ─────────────────── Support function ───────────────────
+
+    /// Compute Merkle root (hex) for a prefix on the LOCAL store (using existing MerkleTree).
+    async fn local_merkle_hex(&self, prefix: &str) -> Result<String> {
+        let (t, _map) = self.build_local_merkle_snapshot(prefix).await?;
+        Ok(match t.get_root_hash() {
+            Some(h) => to_hex(h),
+            None => "0".repeat(64), 
+        })
+    }
+
+    async fn build_local_merkle_snapshot(
+        &self,
+        prefix: &str,
+    ) -> Result<(MerkleTree, HashMap<String, String>)> {
         let mut t = MerkleTree::new();
         let mut map = HashMap::new();
 
-        let mut guard = self.store.lock().await;
-        let keys = guard.scan(""); // empty prefix → all keys
+        let store = self.store.lock().await;
+        let keys = store.scan(prefix); 
         for k in keys {
-            if let Some(v) = guard.get(&k) {
+            if let Some(v) = store.get(&k) {
                 t.insert(&k, &v);
                 map.insert(k, v);
             }
         }
-        drop(guard);
-
-        (t, map)
+        Ok((t, map))
     }
+    /// Reconcile a prefix by SCAN + GET from remote, then apply to local store.
+    async fn reconcile_leaf(&self, addr: &str, prefix: &str) -> Result<()> {
+        info!("RECONCILE prefix={:?}", prefix);
 
-    /// Build remote Merkle snapshot by calling SCAN + GET over TCP.
-    async fn build_remote_merkle_snapshot(
-        &self,
-        addr: &str,
-    ) -> Result<(MerkleTree, HashMap<String, String>)> {
-        let keys = self.read_remote_keys_via_scan(addr).await?;
-        let mut t = MerkleTree::new();
-        let mut map = HashMap::new();
+        let remote_keys = self.remote_scan_keys(addr, prefix).await?;
 
-        for k in keys {
-            match self.read_remote_value_plain(addr, &k).await? {
+        if remote_keys.len() > self.leaf_threshold {
+            log::warn!(
+                "prefix {:?} has {} keys (> leaf_threshold {})",
+                prefix,
+                remote_keys.len(),
+                self.leaf_threshold
+            );
+        }
+
+        let mut remote_map: HashMap<String, Option<String>> = HashMap::new();
+        for k in &remote_keys {
+            remote_map.insert(k.clone(), self.remote_get(addr, k).await?);
+        }
+
+        let mut store = self.store.lock().await;
+
+        for (k, maybe_v) in &remote_map {
+            match maybe_v {
                 Some(v) => {
-                    t.insert(&k, &v);
-                    map.insert(k, v);
+                    let _ = store.set(k.clone(), v.clone());
                 }
                 None => {
-                    // Key disappeared between SCAN and GET; just skip.
+                    let _ = store.delete(k);
                 }
             }
         }
 
-        Ok((t, map))
+        let local_keys = store.scan(prefix);
+        let remote_set: HashSet<&String> = remote_keys.iter().collect();
+        for lk in local_keys {
+            if !remote_set.contains(&lk) {
+                let _ = store.delete(&lk);
+            }
+        }
+
+        Ok(())
     }
 
-    // ───────────── Wire I/O ─────────────
+    // ─────────────────── WIRE I/O (REMOTE) ───────────────────
 
-    /// SCAN (all keys): send "SCAN \r\n" → expect:
-    ///  "KEYS <n>\r\n"
-    ///   then n lines, each is one key.
-    async fn read_remote_keys_via_scan(&self, addr: &str) -> Result<Vec<String>> {
-        debug!("→ {} : SCAN", addr);
+    async fn remote_hash_hex(&self, addr: &str, prefix: &str) -> Result<String> {
+        let cmd = if prefix.is_empty() {
+            "HASH\r\n".to_string()
+        } else {
+            format!("HASH {prefix}\r\n")
+        };
+        let line = self.send_and_read_line(addr, &cmd).await?;
+      
+        let parts: Vec<&str> = line.trim_end().split_whitespace().collect();
+        if parts.is_empty() || parts[0] != "HASH" {
+            return Err(anyhow!("unexpected HASH response: {}", line.trim_end()));
+        }
+       
+        let hex = parts.last().unwrap().to_string();
+        if hex.len() != 64 {
+            return Err(anyhow!("bad HASH hex length: {}", hex));
+        }
+        Ok(hex.to_lowercase())
+    }
+
+   
+    async fn remote_scan_keys(&self, addr: &str, prefix: &str) -> Result<Vec<String>> {
+        let cmd = format!("SCAN {prefix}\r\n");
+        debug!("→ {} : {}", addr, cmd.trim_end());
         let mut stream = TcpStream::connect(addr)
             .await
             .with_context(|| format!("connect {}", addr))?;
-        stream.write_all(b"SCAN \r\n").await.context("write SCAN")?;
+        stream
+            .write_all(cmd.as_bytes())
+            .await
+            .context("write SCAN")?;
 
         let mut reader = BufReader::new(stream);
 
-        // First line: "KEYS <n>\r\n"
+        // header
         let mut header = String::new();
         let n = reader.read_line(&mut header).await?;
         if n == 0 {
@@ -173,7 +228,7 @@ impl SyncManager {
             .parse()
             .context("invalid count after KEYS")?;
 
-        // Next <count> lines: keys
+        // keys
         let mut keys = Vec::with_capacity(count);
         for _ in 0..count {
             let mut line = String::new();
@@ -183,26 +238,13 @@ impl SyncManager {
             }
             keys.push(line.trim_end().to_string());
         }
-
-        debug!("← {} : KEYS {}", addr, keys.len());
         Ok(keys)
     }
 
-    /// GET one key: "GET <key>\r\n" → "VALUE <plain>\r\n" or "NOT_FOUND\r\n"
-    async fn read_remote_value_plain(&self, addr: &str, key: &str) -> Result<Option<String>> {
+    /// GET key → "VALUE <val>" hoặc "NOT_FOUND"
+    async fn remote_get(&self, addr: &str, key: &str) -> Result<Option<String>> {
         let cmd = format!("GET {key}\r\n");
-        debug!("→ {} : {}", addr, cmd.trim_end());
-        let mut stream = TcpStream::connect(addr)
-            .await
-            .with_context(|| format!("connect {}", addr))?;
-        stream.write_all(cmd.as_bytes()).await.context("write GET")?;
-
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            return Err(anyhow!("peer closed on GET {}", key));
-        }
+        let line = self.send_and_read_line(addr, &cmd).await?;
         let line = line.trim_end();
         if line == "NOT_FOUND" {
             return Ok(None);
@@ -212,4 +254,34 @@ impl SyncManager {
         }
         Err(anyhow!("unexpected GET response for {key}: {}", line))
     }
+
+    async fn send_and_read_line(&self, addr: &str, cmd: &str) -> Result<String> {
+        debug!("→ {} : {}", addr, cmd.trim_end());
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("connect {}", addr))?;
+        stream
+            .write_all(cmd.as_bytes())
+            .await
+            .context("write cmd")?;
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Err(anyhow!("peer closed connection"));
+        }
+        debug!("← {} : {}", addr, line.trim_end());
+        Ok(line)
+    }
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
